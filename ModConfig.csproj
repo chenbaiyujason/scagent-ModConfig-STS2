@@ -30,6 +30,8 @@
           ContinueOnError="true" />
     <Exec Command="if exist &quot;$(Sts2Dir)\mods\$(MSBuildProjectName)\$(MSBuildProjectName).dll&quot; move /Y &quot;$(Sts2Dir)\mods\$(MSBuildProjectName)\$(MSBuildProjectName).dll&quot; &quot;$(Sts2Dir)\mods\$(MSBuildProjectName)\$(MSBuildProjectName).dll.bak.%RANDOM%&quot;"
           ContinueOnError="true" />
+    <Exec Command="del /Q &quot;$(Sts2Dir)\mods\$(MSBuildProjectName)\mod_manifest.json&quot; 2&gt;NUL"
+          ContinueOnError="true" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(Sts2Dir)\mods\$(MSBuildProjectName)\" />
     <!-- v0.99+ external manifest (v0.98 reads from PCK, ignores this file) -->
     <Copy SourceFiles="$(MSBuildProjectDirectory)\$(MSBuildProjectName).json"
