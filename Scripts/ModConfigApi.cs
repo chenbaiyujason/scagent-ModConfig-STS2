@@ -5,13 +5,15 @@ namespace ModConfig;
 /// </summary>
 public enum ConfigType
 {
-    Toggle,
-    Slider,
-    Dropdown,
-    KeyBind,
-    TextInput,
-    Header,
-    Separator
+    Toggle,      // 0
+    Slider,      // 1
+    Dropdown,    // 2
+    KeyBind,     // 3
+    TextInput,   // 4
+    Header,      // 5 — preserved for backward compatibility
+    Separator,   // 6 — preserved for backward compatibility
+    Button,      // 7 — v0.2.0+
+    ColorPicker  // 8 — v0.2.0+
 }
 
 /// <summary>
@@ -43,7 +45,7 @@ public class ConfigEntry
     /// <summary>The type of control to render.</summary>
     public ConfigType Type { get; set; }
 
-    /// <summary>Default value. bool for Toggle, float for Slider, string for Dropdown, long for KeyBind, string for TextInput.</summary>
+    /// <summary>Default value. bool for Toggle, float for Slider, string for Dropdown, long for KeyBind, string for TextInput, string (hex like "#FF0000") for ColorPicker. Not used for Button/Header/Separator.</summary>
     public object DefaultValue { get; set; } = false;
 
     /// <summary>Slider minimum value.</summary>
@@ -69,6 +71,15 @@ public class ConfigEntry
 
     /// <summary>TextInput placeholder text.</summary>
     public string Placeholder { get; set; } = "";
+
+    /// <summary>Button display text (for Button type). Separate from Label which is the left-side description.</summary>
+    public string ButtonText { get; set; } = "";
+
+    /// <summary>Optional per-language button texts. Key = language code ("en","zhs",...).</summary>
+    public Dictionary<string, string>? ButtonTexts { get; set; }
+
+    /// <summary>Optional validator. Returns true if value is valid. Used for TextInput red-border feedback.</summary>
+    public Func<object, bool>? Validator { get; set; }
 
     /// <summary>Callback invoked when the value changes.</summary>
     public Action<object>? OnChanged { get; set; }

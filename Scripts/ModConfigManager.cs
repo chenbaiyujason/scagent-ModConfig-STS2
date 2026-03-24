@@ -17,16 +17,22 @@ internal static class ModConfigManager
     private static bool _saveScheduled;
 
     private const string ConfigDir = "user://ModConfig/";
+    private const string UiStateFile = "user://ModConfig/_ui_state.json";
 
     internal static IReadOnlyDictionary<string, ModRegistration> Registrations => _registrations;
+
+    // Persistent collapsed state for mod sections
+    internal static HashSet<string> CollapsedMods { get; private set; } = new();
 
     internal static void Initialize()
     {
         DirAccess.MakeDirRecursiveAbsolute(ConfigDir);
+        LoadUiState();
     }
 
     internal static void Register(ModRegistration reg)
     {
+        NormalizeEntryDefaults(reg);
         _registrations[reg.ModId] = reg;
 
         if (!_values.ContainsKey(reg.ModId))
@@ -36,6 +42,43 @@ internal static class ModConfigManager
         SettingsTabInjector.RefreshUI();
 
         MainFile.Log.Info($"Registered config: {reg.DisplayName} ({reg.Entries.Length} entries)");
+    }
+
+    private static void NormalizeEntryDefaults(ModRegistration reg)
+    {
+        foreach (var entry in reg.Entries)
+        {
+            if (entry.Type != ConfigType.ColorPicker)
+                continue;
+
+            string normalized = NormalizeColorHexOrDefault(entry.DefaultValue);
+            if (entry.DefaultValue is string current && string.Equals(current, normalized, StringComparison.Ordinal))
+                continue;
+
+            entry.DefaultValue = normalized;
+            MainFile.Log.Info($"Normalized ColorPicker default [{reg.ModId}.{entry.Key}] -> {normalized}");
+        }
+    }
+
+    private static string NormalizeColorHexOrDefault(object? value)
+    {
+        if (value is string text)
+        {
+            text = text.Trim();
+            if (!string.IsNullOrEmpty(text))
+            {
+                try
+                {
+                    var color = Color.FromHtml(text.TrimStart('#'));
+                    return "#" + color.ToHtml(false).ToUpperInvariant();
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        return "#FFFFFF";
     }
 
     internal static T GetValue<T>(string modId, string key)
@@ -94,7 +137,7 @@ internal static class ModConfigManager
         bool changed = false;
         foreach (var entry in reg.Entries)
         {
-            if (entry.Type is ConfigType.Header or ConfigType.Separator)
+            if (entry.Type is ConfigType.Header or ConfigType.Separator or ConfigType.Button)
                 continue;
 
             var oldValue = _values[modId].GetValueOrDefault(entry.Key);
@@ -163,7 +206,7 @@ internal static class ModConfigManager
 
         foreach (var entry in reg.Entries)
         {
-            if (entry.Type is ConfigType.Header or ConfigType.Separator)
+            if (entry.Type is ConfigType.Header or ConfigType.Separator or ConfigType.Button)
                 continue;
 
             if (saved != null && saved.TryGetValue(entry.Key, out var element))
@@ -177,6 +220,7 @@ internal static class ModConfigManager
                         ConfigType.Dropdown => element.GetString() ?? (string)entry.DefaultValue,
                         ConfigType.KeyBind => element.GetInt64(),
                         ConfigType.TextInput => element.GetString() ?? (string)entry.DefaultValue,
+                        ConfigType.ColorPicker => element.GetString() ?? (string)entry.DefaultValue,
                         _ => entry.DefaultValue
                     };
                     continue;
@@ -210,5 +254,48 @@ internal static class ModConfigManager
     {
         foreach (var modId in _values.Keys)
             SaveValues(modId);
+    }
+
+    // ─── UI State Persistence ─────────────────────────────────────
+
+    internal static void SaveUiState()
+    {
+        try
+        {
+            var state = new Dictionary<string, object>
+            {
+                ["collapsed_mods"] = CollapsedMods.ToArray()
+            };
+            var json = JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true });
+            using var file = FileAccess.Open(UiStateFile, FileAccess.ModeFlags.Write);
+            file.StoreString(json);
+        }
+        catch (Exception e)
+        {
+            MainFile.Log.Error($"Failed to save UI state: {e}");
+        }
+    }
+
+    private static void LoadUiState()
+    {
+        try
+        {
+            if (!FileAccess.FileExists(UiStateFile)) return;
+            using var file = FileAccess.Open(UiStateFile, FileAccess.ModeFlags.Read);
+            var json = file.GetAsText();
+            var state = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json);
+            if (state != null && state.TryGetValue("collapsed_mods", out var collapsed))
+            {
+                foreach (var item in collapsed.EnumerateArray())
+                {
+                    var val = item.GetString();
+                    if (val != null) CollapsedMods.Add(val);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            MainFile.Log.Error($"Failed to load UI state: {e}");
+        }
     }
 }

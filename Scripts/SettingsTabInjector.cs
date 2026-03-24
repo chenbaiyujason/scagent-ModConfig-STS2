@@ -24,9 +24,11 @@ internal static class SettingsTabInjector
     private static string _activeKeyBindModId = "";
     private static ConfigEntry? _activeKeyBindEntry;
 
-    // Collapsible mod sections — track which mods are collapsed by modId
-    private static readonly HashSet<string> _collapsedMods = new();
+    // Collapsed state now persisted via ModConfigManager.CollapsedMods
     private static readonly Dictionary<(string ModId, string Key), List<LiveBinding>> _liveBindings = new();
+
+    // Cached game font for manually created labels (fixes Linux font rendering)
+    private static Font? _gameFont;
 
     private sealed class LiveBinding
     {
@@ -194,28 +196,24 @@ internal static class SettingsTabInjector
             // Disconnect it and set a fixed max height based on other tabs' panels.
             try
             {
-                var viewport = modsPanel.GetViewport();
-                if (viewport != null)
-                {
-                    var refreshCallable = new Callable(modsPanel, NSettingsPanel.MethodName.RefreshSize);
-                    if (viewport.IsConnected(Viewport.SignalName.SizeChanged, refreshCallable))
-                    {
-                        viewport.Disconnect(Viewport.SignalName.SizeChanged, refreshCallable);
-                    }
-                }
-
                 // Match the first panel's height (it fits the settings screen)
                 float maxHeight = firstPanel.Size.Y;
                 if (maxHeight < 100)
                     maxHeight = modsPanel.GetParent<Control>().Size.Y * 0.85f;
                 modsPanel.Size = new Vector2(modsPanel.Size.X, maxHeight);
+
+                // Override RefreshSize's auto-expansion on window resize
+                var viewport = modsPanel.GetViewport();
+                if (viewport != null)
+                    OverrideRefreshSize(viewport, modsPanel, maxHeight);
             }
             catch (Exception e)
             {
                 MainFile.Log.Error($"Failed to cap panel height: {e}");
             }
 
-            // === 7. Populate ===
+            // === 7. Cache game font + Populate ===
+            CacheGameFont(firstPanel);
             PopulateInto(contentContainer);
             RebuildFocusTargets(modsPanel, contentContainer, preReadyFocusSentinel);
 
@@ -296,25 +294,113 @@ internal static class SettingsTabInjector
 
     private static Control? CreatePreReadyFocusSentinel(NSettingsPanel firstPanel)
     {
+        // Try 1: Duplicate the default focused control (usually an NButton/NTickbox)
         try
         {
-            if (firstPanel.DefaultFocusedControl is not Control defaultFocused ||
-                !GodotObject.IsInstanceValid(defaultFocused))
+            if (firstPanel.DefaultFocusedControl is Control defaultFocused &&
+                GodotObject.IsInstanceValid(defaultFocused) &&
+                defaultFocused.Duplicate() is Control duplicate)
             {
-                return null;
+                duplicate.FocusMode = Control.FocusModeEnum.All;
+                duplicate.Visible = false;
+                return duplicate;
             }
-
-            if (defaultFocused.Duplicate() is not Control duplicate)
-                return null;
-
-            duplicate.FocusMode = Control.FocusModeEnum.All;
-            return duplicate;
         }
-        catch (Exception e)
+        catch { /* fall through to search */ }
+
+        // Try 2: Find any game settings control from original panel's content tree
+        try
         {
-            MainFile.Log.Error($"Failed to create pre-ready focus sentinel: {e}");
-            return null;
+            if (firstPanel.Content is Control content)
+            {
+                var candidate = FindFirstGameSettingsControl(content);
+                if (candidate != null && candidate.Duplicate() is Control dup2)
+                {
+                    dup2.FocusMode = Control.FocusModeEnum.All;
+                    dup2.Visible = false;
+                    return dup2;
+                }
+            }
         }
+        catch { /* fall through */ }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Search for a control that NSettingsPanel.IsSettingsOption() would recognize:
+    /// NTickbox, NSettingsSlider, NDropdownPositioner, NPaginator, or enabled NButton.
+    /// Uses type name check to avoid hard import dependencies on game UI types.
+    /// </summary>
+    private static Control? FindFirstGameSettingsControl(Control parent)
+    {
+        foreach (var child in parent.GetChildren().OfType<Control>())
+        {
+            string typeName = child.GetType().Name;
+            if (typeName is "NTickbox" or "NSettingsSlider" or "NDropdownPositioner" or "NPaginator")
+                return child;
+
+            var found = FindFirstGameSettingsControl(child);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Override RefreshSize's panel expansion on window resize.
+    /// We can't cleanly disconnect the delegate-based Callable that _Ready() creates,
+    /// so instead we re-cap the height after each resize using CallDeferred (runs after RefreshSize).
+    /// </summary>
+    private static void OverrideRefreshSize(Viewport viewport, NSettingsPanel modsPanel, float maxHeight)
+    {
+        var panelRef = new WeakReference<NSettingsPanel>(modsPanel);
+        viewport.SizeChanged += () =>
+        {
+            if (!panelRef.TryGetTarget(out var p) || !GodotObject.IsInstanceValid(p)) return;
+            p.CallDeferred("set_size", new Vector2(p.Size.X, maxHeight));
+        };
+    }
+
+    /// <summary>
+    /// Cache the game's theme font from an existing settings panel for use in manually created labels.
+    /// Fixes font rendering issues on Linux where default system font may lack CJK glyphs.
+    /// </summary>
+    private static void CacheGameFont(NSettingsPanel panel)
+    {
+        if (_gameFont != null) return;
+        try
+        {
+            // Walk the original panel's content to find an existing Label with a theme font
+            if (panel.Content == null) return;
+            foreach (var child in panel.Content.GetChildren())
+            {
+                if (child is Label label)
+                {
+                    _gameFont = label.GetThemeFont("font");
+                    if (_gameFont != null) return;
+                }
+                // Check one level deeper
+                if (child is Control container)
+                {
+                    foreach (var inner in container.GetChildren())
+                    {
+                        if (inner is Label innerLabel)
+                        {
+                            _gameFont = innerLabel.GetThemeFont("font");
+                            if (_gameFont != null) return;
+                        }
+                    }
+                }
+            }
+        }
+        catch { /* non-critical, fall back to default font */ }
+    }
+
+    /// <summary>Apply cached game font to a label if available.</summary>
+    private static void ApplyGameFont(Label label)
+    {
+        if (_gameFont != null)
+            label.AddThemeFontOverride("font", _gameFont);
     }
 
     private static NSettingsPanel? FindOwningSettingsPanel(Control control)
@@ -460,7 +546,7 @@ internal static class SettingsTabInjector
                 AddModSeparator(target);
             first = false;
 
-            bool isCollapsed = _collapsedMods.Contains(modId);
+            bool isCollapsed = ModConfigManager.CollapsedMods.Contains(modId);
 
             // ── Mod header row (▼/▶ Name ─── Reset) with background ──
             string localizedName = reg.GetLocalizedName();
@@ -479,14 +565,15 @@ internal static class SettingsTabInjector
             {
                 if (@event is InputEventMouseButton { Pressed: true, ButtonIndex: MouseButton.Left })
                 {
-                    if (_collapsedMods.Contains(modId))
-                        _collapsedMods.Remove(modId);
+                    if (ModConfigManager.CollapsedMods.Contains(modId))
+                        ModConfigManager.CollapsedMods.Remove(modId);
                     else
-                        _collapsedMods.Add(modId);
+                        ModConfigManager.CollapsedMods.Add(modId);
 
-                    bool collapsed = _collapsedMods.Contains(modId);
+                    bool collapsed = ModConfigManager.CollapsedMods.Contains(modId);
                     capturedEntriesBox.Visible = !collapsed;
                     capturedLabel.Text = $"{(collapsed ? "\u25b6" : "\u25bc")}  {capturedReg.GetLocalizedName()}";
+                    ModConfigManager.SaveUiState();
                 }
             };
 
@@ -515,6 +602,12 @@ internal static class SettingsTabInjector
                         break;
                     case ConfigType.TextInput:
                         AddTextInput(entriesBox, modId, entry);
+                        break;
+                    case ConfigType.Button:
+                        AddButton(entriesBox, modId, entry);
+                        break;
+                    case ConfigType.ColorPicker:
+                        AddColorPicker(entriesBox, modId, entry);
                         break;
                 }
 
@@ -575,6 +668,16 @@ internal static class SettingsTabInjector
         return "";
     }
 
+    private static string ResolveButtonText(ConfigEntry entry)
+    {
+        if (entry.ButtonTexts is { Count: > 0 })
+        {
+            var resolved = ResolveLangDict(entry.ButtonTexts);
+            if (resolved != null) return resolved;
+        }
+        return !string.IsNullOrEmpty(entry.ButtonText) ? entry.ButtonText : ResolveLabel(entry);
+    }
+
     // ─── Description Helper ──────────────────────────────────────
 
     private static void AddDescriptionIfPresent(VBoxContainer parent, ConfigEntry entry)
@@ -590,6 +693,7 @@ internal static class SettingsTabInjector
         };
         label.AddThemeColorOverride("font_color", DimText);
         label.AddThemeFontSizeOverride("font_size", 15);
+        ApplyGameFont(label);
         parent.AddChild(label);
     }
 
@@ -675,6 +779,7 @@ internal static class SettingsTabInjector
         };
         label.AddThemeColorOverride("font_color", CreamGold);
         label.AddThemeFontSizeOverride("font_size", 20);
+        ApplyGameFont(label);
 
         var resetBtn = new Button
         {
@@ -707,6 +812,7 @@ internal static class SettingsTabInjector
         };
         label.AddThemeColorOverride("font_color", DimText);
         label.AddThemeFontSizeOverride("font_size", 20);
+        ApplyGameFont(label);
         parent.AddChild(label);
     }
 
@@ -720,6 +826,7 @@ internal static class SettingsTabInjector
         };
         label.AddThemeColorOverride("font_color", DimText);
         label.AddThemeFontSizeOverride("font_size", 16);
+        ApplyGameFont(label);
         parent.AddChild(label);
     }
 
@@ -744,6 +851,7 @@ internal static class SettingsTabInjector
         };
         label.AddThemeColorOverride("font_color", TextColor);
         label.AddThemeFontSizeOverride("font_size", 20);
+        ApplyGameFont(label);
 
         var toggle = new CheckButton
         {
@@ -795,6 +903,7 @@ internal static class SettingsTabInjector
         };
         label.AddThemeColorOverride("font_color", TextColor);
         label.AddThemeFontSizeOverride("font_size", 20);
+        ApplyGameFont(label);
 
         var slider = new HSlider
         {
@@ -870,6 +979,7 @@ internal static class SettingsTabInjector
         };
         label.AddThemeColorOverride("font_color", TextColor);
         label.AddThemeFontSizeOverride("font_size", 20);
+        ApplyGameFont(label);
 
         var dropdown = new OptionButton { CustomMinimumSize = new Vector2(180, 0) };
 
@@ -933,6 +1043,7 @@ internal static class SettingsTabInjector
         };
         label.AddThemeColorOverride("font_color", TextColor);
         label.AddThemeFontSizeOverride("font_size", 20);
+        ApplyGameFont(label);
 
         long currentKey = ModConfigManager.GetValue<long>(modId, entry.Key);
         var btn = new Button
@@ -1050,6 +1161,7 @@ internal static class SettingsTabInjector
         };
         label.AddThemeColorOverride("font_color", TextColor);
         label.AddThemeFontSizeOverride("font_size", 20);
+        ApplyGameFont(label);
 
         var lineEdit = new LineEdit
         {
@@ -1077,15 +1189,174 @@ internal static class SettingsTabInjector
             return true;
         });
 
+        // Validation visual feedback
+        StyleBoxFlat? validStyle = null;
+        StyleBoxFlat? invalidStyle = null;
+        if (entry.Validator != null)
+        {
+            validStyle = new StyleBoxFlat { BgColor = new Color(0.15f, 0.15f, 0.15f), BorderColor = new Color(0.3f, 0.3f, 0.3f), BorderWidthBottom = 1, BorderWidthTop = 1, BorderWidthLeft = 1, BorderWidthRight = 1, CornerRadiusTopLeft = 3, CornerRadiusTopRight = 3, CornerRadiusBottomLeft = 3, CornerRadiusBottomRight = 3 };
+            invalidStyle = new StyleBoxFlat { BgColor = new Color(0.2f, 0.1f, 0.1f), BorderColor = new Color(0.8f, 0.3f, 0.3f), BorderWidthBottom = 2, BorderWidthTop = 2, BorderWidthLeft = 2, BorderWidthRight = 2, CornerRadiusTopLeft = 3, CornerRadiusTopRight = 3, CornerRadiusBottomLeft = 3, CornerRadiusBottomRight = 3 };
+        }
+
+        void ApplyValidation(LineEdit le, string text)
+        {
+            if (entry.Validator == null) return;
+
+            try
+            {
+                bool isValid = entry.Validator(text);
+                le.AddThemeStyleboxOverride("normal", isValid ? validStyle! : invalidStyle!);
+            }
+            catch (Exception e)
+            {
+                MainFile.Log.Error($"Validator error [{modId}.{entry.Key}]: {e}");
+            }
+        }
+
         // Save on focus lost or Enter pressed
-        lineEdit.TextSubmitted += text => ModConfigManager.SetValue(modId, entry.Key, text);
-        lineEdit.FocusExited += () => ModConfigManager.SetValue(modId, entry.Key, lineEdit.Text);
+        lineEdit.TextSubmitted += text =>
+        {
+            ApplyValidation(lineEdit, text);
+            ModConfigManager.SetValue(modId, entry.Key, text);
+        };
+        lineEdit.FocusExited += () =>
+        {
+            ApplyValidation(lineEdit, lineEdit.Text);
+            ModConfigManager.SetValue(modId, entry.Key, lineEdit.Text);
+        };
+        lineEdit.TextChanged += text => ApplyValidation(lineEdit, text);
+
+        // Apply initial validation state
+        ApplyValidation(lineEdit, lineEdit.Text);
 
         ApplyTooltip(hbox, entry);
         hbox.AddChild(label);
         hbox.AddChild(lineEdit);
         parent.AddChild(hbox);
         AddDescriptionIfPresent(parent, entry);
+    }
+
+    // ─── Button (action trigger, no persisted value) ─────────────
+
+    private static void AddButton(VBoxContainer parent, string modId, ConfigEntry entry)
+    {
+        var hbox = new HBoxContainer { CustomMinimumSize = new Vector2(0, 45) };
+        hbox.AddThemeConstantOverride("separation", 20);
+
+        var label = new Label
+        {
+            Text = $"  {ResolveLabel(entry)}",
+            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
+        };
+        label.AddThemeColorOverride("font_color", TextColor);
+        label.AddThemeFontSizeOverride("font_size", 20);
+        ApplyGameFont(label);
+
+        var btn = new Button
+        {
+            Text = ResolveButtonText(entry),
+            CustomMinimumSize = new Vector2(140, 32),
+            FocusMode = Control.FocusModeEnum.All,
+        };
+        btn.AddThemeFontSizeOverride("font_size", 17);
+
+        btn.Pressed += () =>
+        {
+            try { entry.OnChanged?.Invoke(true); }
+            catch (Exception e) { MainFile.Log.Error($"Button callback error [{modId}.{entry.Key}]: {e}"); }
+        };
+
+        ApplyTooltip(hbox, entry);
+        hbox.AddChild(label);
+        hbox.AddChild(btn);
+        parent.AddChild(hbox);
+        AddDescriptionIfPresent(parent, entry);
+    }
+
+    // ─── ColorPicker ─────────────────────────────────────────────
+
+    private static void AddColorPicker(VBoxContainer parent, string modId, ConfigEntry entry)
+    {
+        var hbox = new HBoxContainer { CustomMinimumSize = new Vector2(0, 45) };
+        hbox.AddThemeConstantOverride("separation", 20);
+
+        var label = new Label
+        {
+            Text = $"  {ResolveLabel(entry)}",
+            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
+        };
+        label.AddThemeColorOverride("font_color", TextColor);
+        label.AddThemeFontSizeOverride("font_size", 20);
+        ApplyGameFont(label);
+
+        var currentHex = ModConfigManager.GetValue<string>(modId, entry.Key);
+        var currentColor = ParseHexColor(currentHex);
+
+        var picker = new ColorPickerButton
+        {
+            Color = currentColor,
+            CustomMinimumSize = new Vector2(60, 32),
+            FocusMode = Control.FocusModeEnum.All,
+            EditAlpha = false,
+            TooltipText = I18n.ColorPickerTooltip,
+        };
+
+        var hexLabel = new Label
+        {
+            Text = currentColor.ToHtml(false).ToUpperInvariant(),
+            CustomMinimumSize = new Vector2(80, 0),
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        hexLabel.AddThemeColorOverride("font_color", CreamGold);
+        hexLabel.AddThemeFontSizeOverride("font_size", 16);
+        ApplyGameFont(hexLabel);
+
+        var guard = new UiUpdateGuard();
+        var pickerRef = new WeakReference<ColorPickerButton>(picker);
+        var hexLabelRef = new WeakReference<Label>(hexLabel);
+
+        RegisterLiveBinding(modId, entry.Key, value =>
+        {
+            if (!TryGetLiveTarget(pickerRef, out var livePicker))
+                return false;
+            if (!TryConvertValue(value, out string hexValue))
+                return true;
+
+            var color = ParseHexColor(hexValue);
+            guard.Suppress = true;
+            livePicker.Color = color;
+            guard.Suppress = false;
+
+            if (TryGetLiveTarget(hexLabelRef, out var liveHexLabel))
+                liveHexLabel.Text = color.ToHtml(false).ToUpperInvariant();
+
+            return true;
+        });
+
+        picker.ColorChanged += color =>
+        {
+            hexLabel.Text = color.ToHtml(false).ToUpperInvariant();
+            if (guard.Suppress) return;
+            ModConfigManager.SetValue(modId, entry.Key, "#" + color.ToHtml(false).ToUpperInvariant());
+        };
+
+        ApplyTooltip(hbox, entry);
+        hbox.AddChild(label);
+        hbox.AddChild(picker);
+        hbox.AddChild(hexLabel);
+        parent.AddChild(hbox);
+        AddDescriptionIfPresent(parent, entry);
+    }
+
+    private static Color ParseHexColor(string? hex)
+    {
+        if (string.IsNullOrEmpty(hex)) return Colors.White;
+        try
+        {
+            hex = hex.TrimStart('#');
+            return Color.FromHtml(hex);
+        }
+        catch { return Colors.White; }
     }
 
     private static bool TryGetLiveTarget<T>(WeakReference<T> reference, out T target) where T : GodotObject

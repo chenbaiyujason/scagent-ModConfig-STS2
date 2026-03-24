@@ -30,6 +30,7 @@ internal static class I18n
     internal static string PressAnyKey => Get("press_any_key", "Press any key...");
     internal static string KeyUnbound => Get("key_unbound", "Unbound");
     internal static string KeyBindTooltip => Get("keybind_tooltip", "Click to rebind. Press Esc or click anywhere to clear.");
+    internal static string ColorPickerTooltip => Get("color_picker_tooltip", "Click to pick a color.");
 
     // ─── Lifecycle ──────────────────────────────────────────────────
 
