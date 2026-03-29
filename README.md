@@ -57,179 +57,75 @@ Install ModConfig alongside any mod that supports it. A new **"Mods"** tab will 
 
 ## Quick Start / 快速开始
 
-### 1. Create a ModConfigBridge.cs in your mod
+### 1. Copy the template / 复制模板
+
+Download **[`examples/ModConfigBridge.cs`](examples/ModConfigBridge.cs)** into your mod's `Scripts/` folder. This is a **complete, drop-in file** with all control types included — just replace the namespace, mod ID, and edit `BuildEntries()`.
+
+将 **[`examples/ModConfigBridge.cs`](examples/ModConfigBridge.cs)** 复制到你模组的 `Scripts/` 目录。这是一个**完整可直接使用的文件**，包含所有控件类型的示例——只需替换命名空间、模组 ID，然后编辑 `BuildEntries()`。
+
+The template includes working examples for: Toggle, Slider, Dropdown, KeyBind (uncommented) + TextInput, Button, ColorPicker (commented, uncomment to use).
+
+模板内含可用示例：开关、滑条、下拉框、快捷键（已启用）+ 文本输入、按钮、颜色选择器（已注释，取消注释即可用）。
+
+### 2. Call DeferredRegister() in Initialize() / 在 Initialize 中调用
 
 ```csharp
 using System.Reflection;
+using HarmonyLib;
+using MegaCrit.Sts2.Core.Modding;
 
 namespace YourMod;
 
-/// <summary>
-/// Weak-dependency bridge to ModConfig. Works via reflection — no DLL reference needed.
-/// </summary>
-internal static class ModConfigBridge
+[ModInitializer(nameof(Initialize))]
+public partial class MainFile : Godot.Node
 {
-    private static bool _detected;
-    private static bool _available;
-    private static Type? _apiType;
-    private static Type? _entryType;
-    private static Type? _configType;
+    internal const string ModId = "your.mod.id";
 
-    /// <summary>Check if ModConfig is loaded (cached after first check).</summary>
-    internal static bool IsAvailable
+    public static void Initialize()
     {
-        get
-        {
-            if (!_detected)
-            {
-                _detected = true;
-                _apiType = Type.GetType("ModConfig.ModConfigApi, ModConfig");
-                _entryType = Type.GetType("ModConfig.ConfigEntry, ModConfig");
-                _configType = Type.GetType("ModConfig.ConfigType, ModConfig");
-                _available = _apiType != null && _entryType != null && _configType != null;
-            }
-            return _available;
-        }
-    }
+        Harmony harmony = new(ModId);
+        harmony.PatchAll(Assembly.GetExecutingAssembly());
 
-    /// <summary>
-    /// Register config entries with ModConfig.
-    /// Call this AFTER all mods have loaded (use SceneTree.ProcessFrame callback).
-    /// </summary>
-    internal static void Register()
-    {
-        if (!IsAvailable) return;
-
-        try
-        {
-            DeferredRegister();
-        }
-        catch (Exception e)
-        {
-            // Log error but don't crash — ModConfig is optional
-            Console.WriteLine($"ModConfig registration failed: {e}");
-        }
-    }
-
-    private static void DeferredRegister()
-    {
-        // Build config entries via reflection
-        var entries = new[]
-        {
-            MakeEntry("my_toggle", "My Feature", ConfigTypeValue("Toggle"),
-                defaultValue: true,
-                onChanged: v => MySettings.FeatureEnabled = (bool)v),
-
-            MakeEntry("my_slider", "Speed", ConfigTypeValue("Slider"),
-                defaultValue: 1.0f, min: 0.5f, max: 3.0f, step: 0.1f, format: "F1",
-                onChanged: v => MySettings.Speed = (float)v),
-
-            MakeEntry("my_color", "Highlight Color", ConfigTypeValue("ColorPicker"),
-                defaultValue: "#FF6600",
-                onChanged: v => MySettings.HighlightColor = (string)v),
-
-            MakeEntry("my_name", "Player Name", ConfigTypeValue("TextInput"),
-                defaultValue: "",
-                validator: v => !string.IsNullOrWhiteSpace((string)v),
-                onChanged: v => MySettings.PlayerName = (string)v),
-
-            MakeEntry("reset", "Reset All Data", ConfigTypeValue("Button"),
-                buttonText: "Reset",
-                onChanged: _ => MySettings.ResetAll()),
-        };
-
-        // Call ModConfigApi.Register(modId, displayName, entries)
-        var register = _apiType!.GetMethod("Register",
-            new[] { typeof(string), typeof(string), entries.GetType() });
-        register?.Invoke(null, new object[] { "YourMod", "Your Mod Name", entries });
-    }
-
-    // ─── Reflection Helpers ──────────────────────────────────────
-
-    private static object ConfigTypeValue(string name) =>
-        Enum.Parse(_configType!, name);
-
-    private static object MakeEntry(string key, string label, object type,
-        object? defaultValue = null, float min = 0, float max = 100, float step = 1,
-        string format = "F0", string[]? options = null,
-        string? buttonText = null, Func<object, bool>? validator = null,
-        Action<object>? onChanged = null,
-        Dictionary<string, string>? labels = null,
-        Dictionary<string, string>? descriptions = null)
-    {
-        var entry = Activator.CreateInstance(_entryType!)!;
-        SetProp(entry, "Key", key);
-        SetProp(entry, "Label", label);
-        SetProp(entry, "Type", type);
-        if (defaultValue != null) SetProp(entry, "DefaultValue", defaultValue);
-        SetProp(entry, "Min", min);
-        SetProp(entry, "Max", max);
-        SetProp(entry, "Step", step);
-        SetProp(entry, "Format", format);
-        if (options != null) SetProp(entry, "Options", options);
-        if (buttonText != null) SetProp(entry, "ButtonText", buttonText);
-        if (validator != null) SetProp(entry, "Validator", validator);
-        if (onChanged != null) SetProp(entry, "OnChanged", onChanged);
-        if (labels != null) SetProp(entry, "Labels", labels);
-        if (descriptions != null) SetProp(entry, "Descriptions", descriptions);
-        return entry;
-    }
-
-    private static void SetProp(object obj, string name, object value)
-    {
-        obj.GetType().GetProperty(name)?.SetValue(obj, value);
-    }
-
-    /// <summary>Read a config value with fallback.</summary>
-    internal static T GetValue<T>(string modId, string key, T fallback)
-    {
-        if (!IsAvailable) return fallback;
-        try
-        {
-            var method = _apiType!.GetMethod("GetValue")!.MakeGenericMethod(typeof(T));
-            return (T)method.Invoke(null, new object[] { modId, key })!;
-        }
-        catch { return fallback; }
+        // One line — deferred registration is built into the template
+        ModConfigBridge.DeferredRegister();
     }
 }
 ```
 
-### 2. Call Register() in your mod's Initialize()
+> **Why deferred?** Your mod may load before ModConfig (alphabetical order). `DeferredRegister()` waits one frame so ModConfig's types are available for reflection. This logic is built into the template — just call it.
+>
+> **为什么要延迟？** 你的模组可能比 ModConfig 先加载（按字母顺序）。`DeferredRegister()` 会等一帧确保 ModConfig 已就绪。模板已内置此逻辑，直接调用即可。
 
-Use a **deferred callback** so ModConfig has time to load first:
-
-```csharp
-public static void Initialize()
-{
-    // ... your mod init code ...
-
-    // Deferred registration — wait one frame for all mods to load
-    var tree = (Godot.SceneTree)Godot.Engine.GetMainLoop();
-    tree.ProcessFrame += () =>
-    {
-        tree.ProcessFrame += () => ModConfigBridge.Register();
-    };
-}
-```
-
-### 3. Read config values at runtime
+### 3. Read/write config values at runtime / 运行时读写配置
 
 ```csharp
-// In your mod logic:
-bool enabled = ModConfigBridge.GetValue("YourMod", "my_toggle", true);
-float speed = ModConfigBridge.GetValue("YourMod", "my_slider", 1.0f);
+// Read a saved value (returns fallback if ModConfig not installed)
+bool enabled = ModConfigBridge.GetValue("featureEnabled", true);
+float speed  = ModConfigBridge.GetValue("speedMultiplier", 1.0f);
+
+// Write back when your mod changes a setting outside ModConfig's UI
+// (e.g. via hotkey or your own menu) — ensures the value persists
+ModConfigBridge.SetValue("featureEnabled", false);
 ```
 
 ## Bilingual Labels / 多语言标签
 
-Use the `Labels` and `Descriptions` dictionaries for runtime i18n:
+The template uses a helper `L(en, zhs)` for bilingual labels — just pass English and Chinese:
+
+模板使用 `L(en, zhs)` 辅助函数实现双语标签——只需传入英文和中文：
 
 ```csharp
-MakeEntry("my_toggle", "My Feature", ConfigTypeValue("Toggle"),
-    defaultValue: true,
-    labels: new() { { "en", "My Feature" }, { "zhs", "我的功能" } },
-    descriptions: new() { { "en", "Enable this feature" }, { "zhs", "启用此功能" } },
-    onChanged: v => { /* ... */ });
+list.Add(Entry(cfg =>
+{
+    Set(cfg, "Key", "myToggle");
+    Set(cfg, "Label", "My Feature");
+    Set(cfg, "Labels", L("My Feature", "我的功能"));           // bilingual label
+    Set(cfg, "Type", EnumVal("Toggle"));
+    Set(cfg, "DefaultValue", (object)true);
+    Set(cfg, "Description", "Enable this feature");
+    Set(cfg, "Descriptions", L("Enable this feature", "启用此功能"));  // bilingual desc
+    Set(cfg, "OnChanged", new Action<object>(v => { /* ... */ }));
+}));
 ```
 
 ## ConfigEntry Properties / 配置项属性
@@ -257,10 +153,14 @@ MakeEntry("my_toggle", "My Feature", ConfigTypeValue("Toggle"),
 
 ## Real-World Examples / 实际案例
 
-These mods already integrate with ModConfig:
+These mods already integrate with ModConfig (all open-source):
+
+这些模组已接入 ModConfig（均已开源）：
 
 - **[Skada: Damage Meter](https://www.nexusmods.com/slaythespire2/mods/14)** — 5 settings (FontScale, Opacity, MaxBars, AutoReset, AutoSwitch)
-- **SpeedX** — 14 settings (8 Toggle + 3 Slider + 3 KeyBind)
+- **[SpeedX](https://www.nexusmods.com/slaythespire2/mods/18)** — 22 settings (10 Toggle + 3 Slider + 5 KeyBind + Headers)
+- **[Rewind](https://www.nexusmods.com/slaythespire2/mods/26)** — 8 settings (Toggle + Slider + Dropdown + KeyBind)
+- **[QuickLink](https://www.nexusmods.com/slaythespire2/mods/30)** — 8 settings (Toggle + Slider + Dropdown)
 
 ## Common Pitfalls / 常见问题
 
