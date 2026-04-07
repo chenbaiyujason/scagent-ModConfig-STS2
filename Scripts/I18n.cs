@@ -4,7 +4,7 @@ using Godot;
 using MegaCrit.Sts2.Core.Localization;
 using FileAccess = Godot.FileAccess;
 
-namespace ModConfig;
+namespace ModConfigSCAgent;
 
 /// <summary>
 /// Localization system with dual-channel loading (embedded DLL + PCK)
@@ -25,12 +25,15 @@ internal static class I18n
     // ─── Public Properties ──────────────────────────────────────────
 
     internal static string TabMods => Get("tab_mods", "Mods");
+    /// <summary>本 fork 设置标签（与官方 ModConfig 的「Mods」并列）。</summary>
+    internal static string TabScagent => Get("tab_scagent", "SCAgent");
     internal static string NoConfigs => Get("no_configs", "No mods have registered configurations.");
     internal static string ResetDefaults => Get("reset_defaults", "Reset");
     internal static string PressAnyKey => Get("press_any_key", "Press any key...");
     internal static string KeyUnbound => Get("key_unbound", "Unbound");
     internal static string KeyBindTooltip => Get("keybind_tooltip", "Click to rebind. Press Esc or click anywhere to clear.");
     internal static string ColorPickerTooltip => Get("color_picker_tooltip", "Click to pick a color.");
+    internal static string ReadonlySyncedFromHost => Get("readonly_synced_from_host", "该字段同步自主机，请让主机修改后自动同步。");
 
     // ─── Lifecycle ──────────────────────────────────────────────────
 
@@ -117,7 +120,7 @@ internal static class I18n
             if (translations is { Count: > 0 })
                 return translations;
 
-            var pck = TryLoadFromPck($"res://ModConfig/localization/{candidate}.json");
+            var pck = TryLoadFromPck($"res://ModConfigSCAgent/localization/{candidate}.json");
             if (pck is { Count: > 0 })
                 return pck;
         }
@@ -129,7 +132,7 @@ internal static class I18n
         try
         {
             var stream = Assembly.GetExecutingAssembly()
-                .GetManifestResourceStream($"ModConfig.localization.{lang}.json");
+                .GetManifestResourceStream($"ModConfigSCAgent.localization.{lang}.json");
             if (stream == null) return null;
 
             using var reader = new StreamReader(stream);

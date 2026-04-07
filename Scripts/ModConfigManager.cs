@@ -1,8 +1,9 @@
+using System.Linq;
 using System.Text.Json;
 using Godot;
 using FileAccess = Godot.FileAccess;
 
-namespace ModConfig;
+namespace ModConfigSCAgent;
 
 /// <summary>
 /// Internal state management and persistence for mod configurations.
@@ -16,13 +17,29 @@ internal static class ModConfigManager
     private static readonly HashSet<string> _dirtyMods = new();
     private static bool _saveScheduled;
 
-    private const string ConfigDir = "user://ModConfig/";
-    private const string UiStateFile = "user://ModConfig/_ui_state.json";
+    /// <summary>与官方 ModConfig 的 user://ModConfig/ 分离，避免配置混用。</summary>
+    private const string ConfigDir = "user://ModConfigSCAgent/";
+    private const string UiStateFile = "user://ModConfigSCAgent/_ui_state.json";
 
     internal static IReadOnlyDictionary<string, ModRegistration> Registrations => _registrations;
 
+    /// <summary>查找已注册的配置项（供运行时更新下拉选项等）。</summary>
+    internal static ConfigEntry? TryGetConfigEntry(string modId, string key)
+    {
+        if (!_registrations.TryGetValue(modId, out ModRegistration? reg))
+        {
+            return null;
+        }
+
+        // 不可使用 static lambda：需捕获参数 key。
+        return reg.Entries.FirstOrDefault(entry => entry.Key == key);
+    }
+
     // Persistent collapsed state for mod sections
     internal static HashSet<string> CollapsedMods { get; private set; } = new();
+
+    // Persistent collapsed state for per-mod large section headers (e.g. "大模型接入")
+    internal static HashSet<string> CollapsedSections { get; private set; } = new();
 
     internal static void Initialize()
     {
@@ -105,13 +122,22 @@ internal static class ModConfigManager
 
     internal static void SetValue(string modId, string key, object value)
     {
+        SetValueCore(modId, key, value, invokeOnChanged: true, persistToDisk: true);
+    }
+
+    internal static void SetValueWithoutSave(string modId, string key, object value)
+    {
+        SetValueCore(modId, key, value, invokeOnChanged: false, persistToDisk: false);
+    }
+
+    private static void SetValueCore(string modId, string key, object value, bool invokeOnChanged, bool persistToDisk)
+    {
         if (!_values.ContainsKey(modId))
             _values[modId] = new Dictionary<string, object>();
 
         _values[modId][key] = value;
 
-        // Fire callback
-        if (_registrations.TryGetValue(modId, out var reg))
+        if (invokeOnChanged && _registrations.TryGetValue(modId, out var reg))
         {
             var entry = reg.Entries.FirstOrDefault(e => e.Key == key);
             try { entry?.OnChanged?.Invoke(value); }
@@ -119,7 +145,8 @@ internal static class ModConfigManager
         }
 
         SettingsTabInjector.NotifyValueChanged(modId, key, value);
-        ScheduleSave(modId);
+        if (persistToDisk)
+            ScheduleSave(modId);
     }
 
     /// <summary>
@@ -264,7 +291,8 @@ internal static class ModConfigManager
         {
             var state = new Dictionary<string, object>
             {
-                ["collapsed_mods"] = CollapsedMods.ToArray()
+                ["collapsed_mods"] = CollapsedMods.ToArray(),
+                ["collapsed_sections"] = CollapsedSections.ToArray()
             };
             var json = JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true });
             using var file = FileAccess.Open(UiStateFile, FileAccess.ModeFlags.Write);
@@ -290,6 +318,15 @@ internal static class ModConfigManager
                 {
                     var val = item.GetString();
                     if (val != null) CollapsedMods.Add(val);
+                }
+            }
+
+            if (state != null && state.TryGetValue("collapsed_sections", out var collapsedSections))
+            {
+                foreach (var item in collapsedSections.EnumerateArray())
+                {
+                    var val = item.GetString();
+                    if (val != null) CollapsedSections.Add(val);
                 }
             }
         }

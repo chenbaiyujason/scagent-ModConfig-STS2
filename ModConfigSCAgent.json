@@ -1,0 +1,11 @@
+{
+  "id": "sts2.scagent.modconfig",
+  "name": "ModConfig-SCAgent",
+  "author": "SCAgent fork (based on 皮一下就很凡 ModConfig)",
+  "description": "基于 ModConfig 的 SCAgent 专用分支：独立模组 ID 与用户目录，可与官方 ModConfig 同时安装。\nFork for SCAgent: unique mod id and user paths; can coexist with vanilla ModConfig.",
+  "version": "0.8.6",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": false
+}

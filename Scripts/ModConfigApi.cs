@@ -1,4 +1,4 @@
-namespace ModConfig;
+namespace ModConfigSCAgent;
 
 /// <summary>
 /// Config entry types supported by ModConfig.
@@ -127,6 +127,12 @@ internal class ModRegistration
 public static class ModConfigApi
 {
     /// <summary>
+    /// 某一模组的配置区块刚被渲染进设置树之后触发（含语言切换后的全量重建）。
+    /// 供宿主模组在不引用本程序集具体类型的情况下同步联动 UI（显隐、动态下拉等）。
+    /// </summary>
+    private static Action<string>? _afterModSectionPopulated;
+
+    /// <summary>
     /// Register a mod's configuration entries.
     /// Call this in your mod's Initialize() method.
     /// </summary>
@@ -172,5 +178,67 @@ public static class ModConfigApi
     public static void SetValue(string modId, string key, object value)
     {
         ModConfigManager.SetValue(modId, key, value);
+    }
+
+    /// <summary>
+    /// 只刷新内存与已挂载 UI，不触发 OnChanged，也不写回本地 JSON。
+    /// 适用于联机中镜像主机配置值等“只读显示”场景。
+    /// </summary>
+    public static void SetValueWithoutSave(string modId, string key, object value)
+    {
+        ModConfigManager.SetValueWithoutSave(modId, key, value);
+    }
+
+    /// <summary>
+    /// 运行时替换下拉框选项（不触发 <see cref="ConfigEntry.OnChanged"/>），并刷新已挂载的 <see cref="OptionButton"/>。
+    /// 适用于「依赖另一项」的动态列表（如按供应商筛选模型）。
+    /// </summary>
+    public static void SetDropdownOptions(string modId, string key, string[] options)
+    {
+        ConfigEntry? entry = ModConfigManager.TryGetConfigEntry(modId, key);
+        if (entry == null || entry.Type != ConfigType.Dropdown)
+        {
+            return;
+        }
+
+        entry.Options = options != null ? (string[])options.Clone() : Array.Empty<string>();
+        entry.OptionsKeys = null;
+        SettingsTabInjector.ApplyDropdownOptions(modId, key);
+    }
+
+    /// <summary>
+    /// 运行时显示或隐藏某一配置项对应的整行 UI（含说明文字与行间分隔线）。
+    /// </summary>
+    public static void SetEntryRowVisible(string modId, string key, bool visible)
+    {
+        SettingsTabInjector.ApplyEntryRowVisibility(modId, key, visible);
+    }
+
+    /// <summary>
+    /// 运行时把某项配置切到只读/可编辑状态，并可附带提示文案。
+    /// </summary>
+    public static void SetEntryReadonly(string modId, string key, bool isReadonly, string? readonlyReason = null)
+    {
+        SettingsTabInjector.ApplyEntryReadonly(modId, key, isReadonly, readonlyReason);
+    }
+
+    /// <summary>
+    /// 注册「某 mod 配置区已挂载到设置面板」回调；传 null 可解绑。
+    /// </summary>
+    public static void SetAfterModSectionPopulatedCallback(Action<string>? callback)
+    {
+        _afterModSectionPopulated = callback;
+    }
+
+    internal static void NotifyModSectionPopulated(string modId)
+    {
+        try
+        {
+            _afterModSectionPopulated?.Invoke(modId);
+        }
+        catch (Exception e)
+        {
+            MainFile.Log.Error($"AfterModSectionPopulated [{modId}] failed: {e}");
+        }
     }
 }

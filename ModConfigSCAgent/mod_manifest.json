@@ -1,0 +1,8 @@
+{
+  "pck_name": "ModConfigSCAgent",
+  "id": "sts2.scagent.modconfig",
+  "name": "ModConfig-SCAgent",
+  "author": "SCAgent fork (based on 皮一下就很凡 ModConfig)",
+  "description": "SCAgent 专用 ModConfig 分支。",
+  "version": "0.8.6"
+}

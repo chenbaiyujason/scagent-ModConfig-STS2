@@ -1,0 +1,53 @@
+<Project Sdk="Godot.NET.Sdk/4.5.1">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>true</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <AssemblyName>ModConfigSCAgent</AssemblyName>
+    <RootNamespace>ModConfigSCAgent</RootNamespace>
+    <!-- 安装目录名：与 Nexus 版 ModConfig 并存时不冲突 -->
+    <ModDeployFolder Condition="'$(ModDeployFolder)' == ''">ModConfig-SCAgent</ModDeployFolder>
+    <!-- 与 ModManifest.id 一致：游戏 ModManager 只加载 {id}.dll / {id}.pck -->
+    <GameModIdFileStem>sts2.scagent.modconfig</GameModIdFileStem>
+    <!--
+      默认假定本仓库位于游戏工程下的 mod_projects/<子目录>/，游戏根目录为上两级。
+      若在 Steam 安装目录旁单独克隆，可在同目录建立 Directory.Build.props 覆盖：
+      <Project><PropertyGroup><Sts2Dir>D:\Steam\...\Slay the Spire 2</Sts2Dir></PropertyGroup></Project>
+    -->
+    <Sts2Dir Condition="'$(Sts2Dir)' == ''">$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..'))</Sts2Dir>
+    <Sts2DataDir Condition="'$(Sts2DataDir)' == ''">$(Sts2Dir)\.godot\mono\temp\bin\Debug</Sts2DataDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="sts2">
+      <HintPath>$(Sts2DataDir)\sts2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="ModConfigSCAgent\**" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="ModConfigSCAgent\localization\**\*.json">
+      <LogicalName>ModConfigSCAgent.localization.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+  <Target Name="CopyMod" AfterTargets="PostBuildEvent">
+    <!-- 旧版曾输出 ModConfigSCAgent.dll，清理以免与正确文件名并存 -->
+    <Exec Command="del /Q &quot;$(Sts2Dir)\mods\$(ModDeployFolder)\$(AssemblyName).dll.bak*&quot; 2&gt;NUL"
+          ContinueOnError="true" />
+    <Exec Command="if exist &quot;$(Sts2Dir)\mods\$(ModDeployFolder)\$(AssemblyName).dll&quot; move /Y &quot;$(Sts2Dir)\mods\$(ModDeployFolder)\$(AssemblyName).dll&quot; &quot;$(Sts2Dir)\mods\$(ModDeployFolder)\$(AssemblyName).dll.bak.%RANDOM%&quot;"
+          ContinueOnError="true" />
+    <Exec Command="del /Q &quot;$(Sts2Dir)\mods\$(ModDeployFolder)\$(GameModIdFileStem).dll.bak*&quot; 2&gt;NUL"
+          ContinueOnError="true" />
+    <Exec Command="if exist &quot;$(Sts2Dir)\mods\$(ModDeployFolder)\$(GameModIdFileStem).dll&quot; move /Y &quot;$(Sts2Dir)\mods\$(ModDeployFolder)\$(GameModIdFileStem).dll&quot; &quot;$(Sts2Dir)\mods\$(ModDeployFolder)\$(GameModIdFileStem).dll.bak.%RANDOM%&quot;"
+          ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFiles="$(Sts2Dir)\mods\$(ModDeployFolder)\$(GameModIdFileStem).dll" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\$(AssemblyName).json"
+          DestinationFolder="$(Sts2Dir)\mods\$(ModDeployFolder)\"
+          ContinueOnError="true" />
+    <!-- 勿复制 mod_manifest.json：与 ModConfigSCAgent.json 同 id，会导致重复注册 -->
+  </Target>
+</Project>

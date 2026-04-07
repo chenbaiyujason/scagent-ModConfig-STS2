@@ -62,9 +62,12 @@ internal static class ModConfigBridge
                 })
                 .ToArray();
 
-            _apiType = allTypes.FirstOrDefault(t => t.FullName == "ModConfig.ModConfigApi");
-            _entryType = allTypes.FirstOrDefault(t => t.FullName == "ModConfig.ConfigEntry");
-            _configTypeEnum = allTypes.FirstOrDefault(t => t.FullName == "ModConfig.ConfigType");
+            _apiType = allTypes.FirstOrDefault(t => t.FullName == "ModConfigSCAgent.ModConfigApi")
+                       ?? allTypes.FirstOrDefault(t => t.FullName == "ModConfig.ModConfigApi");
+            _entryType = allTypes.FirstOrDefault(t => t.FullName == "ModConfigSCAgent.ConfigEntry")
+                         ?? allTypes.FirstOrDefault(t => t.FullName == "ModConfig.ConfigEntry");
+            _configTypeEnum = allTypes.FirstOrDefault(t => t.FullName == "ModConfigSCAgent.ConfigType")
+                               ?? allTypes.FirstOrDefault(t => t.FullName == "ModConfig.ConfigType");
             _available = _apiType != null && _entryType != null && _configTypeEnum != null;
         }
         catch

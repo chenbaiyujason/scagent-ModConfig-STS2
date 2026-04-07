@@ -1,23 +1,36 @@
 using System.Collections;
+using System.Collections.Generic;
 using System.Reflection;
+using System.Threading.Tasks;
 using Godot;
 using MegaCrit.Sts2.Core.Nodes.GodotExtensions;
 using MegaCrit.Sts2.Core.Nodes.Screens.Settings;
 
-namespace ModConfig;
+namespace ModConfigSCAgent;
 
 /// <summary>
-/// Injects a "Mods" tab into the game's settings screen using SceneTree signals.
+/// 注入「SCAgent」设置页：展示<strong>本程序集</strong> <see cref="ModConfigApi.Register"/> 的<strong>全部</strong>模组配置。
+/// 与官方 ModConfig 的注册表、标签页彼此独立；官方仍走其「Mods」页。
 /// Zero Harmony — pure Godot public API + reflection for private field access.
 /// </summary>
 internal static class SettingsTabInjector
 {
     private static readonly BindingFlags PrivateInstance = BindingFlags.NonPublic | BindingFlags.Instance;
 
-    // Track all injected instances (main menu + pause menu are separate instances)
+    // 主菜单 / 暂停菜单各一套内容容器
     private static readonly List<WeakReference<VBoxContainer>> _allContainers = new();
     private static readonly List<WeakReference<NSettingsTab>> _allTabs = new();
+    /// <summary>同一 modId+key 可能对应多个 OptionButton（多实例设置界面），刷新选项时全部重建。</summary>
+    private static readonly Dictionary<(string ModId, string Key), List<WeakReference<OptionButton>>> _dropdownWidgets = new();
+
+    /// <summary>可折叠配置行根节点（含表单项与底部分隔线），供运行时按逻辑显示/隐藏整行。</summary>
+    private static readonly Dictionary<(string ModId, string Key), List<WeakReference<Control>>> _entryRowHosts = new();
+    /// <summary>每个配置项登记的可交互控件，用于运行时切只读/恢复。</summary>
+    private static readonly Dictionary<(string ModId, string Key), List<ReadonlyBinding>> _readonlyBindings = new();
+    /// <summary>每个配置项当前是否处于只读态，以及其提示文案。</summary>
+    private static readonly Dictionary<(string ModId, string Key), EntryReadonlyState> _entryReadonlyStates = new();
     private static bool _i18nSubscribed;
+    private static CanvasLayer? _readonlyNoticeLayer;
 
     // KeyBind capture state
     private static Button? _activeKeyBindButton;
@@ -40,9 +53,31 @@ internal static class SettingsTabInjector
         public Func<object, bool> Apply { get; }
     }
 
+    private sealed class ReadonlyBinding
+    {
+        public required WeakReference<Control> ControlRef { get; init; }
+        public required Action<Control, bool> ApplyReadonlyState { get; init; }
+        public required Func<string?> ResolveNormalTooltip { get; init; }
+    }
+
+    private sealed class EntryReadonlyState
+    {
+        public bool IsReadonly { get; set; }
+        public string? Reason { get; set; }
+    }
+
     private sealed class UiUpdateGuard
     {
         public bool Suppress { get; set; }
+    }
+
+    private sealed class SectionRenderState
+    {
+        public required string ModId { get; init; }
+        public required ConfigEntry HeaderEntry { get; init; }
+        public required VBoxContainer Body { get; init; }
+        public required Label HeaderLabel { get; init; }
+        public required bool IsCollapsible { get; init; }
     }
 
     // ─── Colors matching the game's settings screen palette ─────────
@@ -52,7 +87,9 @@ internal static class SettingsTabInjector
     private static readonly Color ResetColor = new(0.8f, 0.5f, 0.4f);
     private static readonly Color KeyBindListening = new(1.0f, 0.85f, 0.3f);
     private static readonly Color ModHeaderBg = new("2C434F");
+    private static readonly Color SectionHeaderBg = new("22333D");
     private static readonly Color RowSeparatorColor = new("2C434F", 0.5f);
+    private static readonly Color ReadonlyRowModulate = new(0.72f, 0.72f, 0.72f, 0.92f);
 
     internal static void Initialize()
     {
@@ -65,7 +102,8 @@ internal static class SettingsTabInjector
         if (node is not NSettingsTabManager)
             return;
 
-        if (node.GetNodeOrNull("Mods") != null)
+        // 本 fork 专用标签名，勿与官方 ModConfig 的 "Mods" 重名；已注入则跳过（主菜单 / 暂停各一次）
+        if (node.GetNodeOrNull("SCAgent") != null)
             return;
 
         node.Connect("ready",
@@ -73,6 +111,7 @@ internal static class SettingsTabInjector
             (uint)GodotObject.ConnectFlags.OneShot);
     }
 
+    /// <summary>注入一页：列出所有通过 <c>ModConfigSCAgent.ModConfigApi</c> 注册的模组（含多 modId）。</summary>
     private static void InjectModsTab(NSettingsTabManager tabManager)
     {
         try
@@ -106,123 +145,124 @@ internal static class SettingsTabInjector
                 return;
             }
 
-            // === 1. Create "Mods" tab ===
-            var modsTab = (NSettingsTab)firstTab.Duplicate();
-            modsTab.Name = "Mods";
-
-            var tabImage = modsTab.GetNodeOrNull<TextureRect>("TabImage");
-            if (tabImage?.Material is ShaderMaterial shader)
-                tabImage.Material = (ShaderMaterial)shader.Duplicate();
-
-            tabManager.AddChild(modsTab);
-            modsTab.SetLabel(I18n.TabMods);
-            modsTab.Deselect();
-            PositionNewTab(tabs, modsTab);
-
-            // === 2. Create panel ===
-            // Duplicate then clean up BEFORE adding to tree.
-            // Game-internal nodes (NDropdownPositioner etc.) fire _Ready() on AddChild
-            // and reference controls from the original panel → ObjectDisposedException.
-            var modsPanel = (NSettingsPanel)firstPanel.Duplicate();
-            modsPanel.Name = "ModsSettings";
-            modsPanel.Visible = false;
-            Control? preReadyFocusSentinel = CreatePreReadyFocusSentinel(firstPanel);
-
-            // Identify Content container name from the original (already in tree)
-            var contentName = firstPanel.Content?.Name;
-            VBoxContainer? contentContainer = null;
-
-            foreach (var child in modsPanel.GetChildren().ToArray())
-            {
-                bool keepAsContent =
-                    child is VBoxContainer vboxCandidate &&
-                    ((contentName != null && child.Name == contentName) ||
-                     (contentName == null && contentContainer == null));
-
-                if (keepAsContent && child is VBoxContainer vbox)
-                {
-                    contentContainer = vbox;
-                    foreach (var inner in vbox.GetChildren().ToArray())
-                    {
-                        vbox.RemoveChild(inner);
-                        inner.Free();
-                    }
-                }
-                else
-                {
-                    modsPanel.RemoveChild(child);
-                    child.Free();
-                }
-            }
-
-            if (contentContainer != null && preReadyFocusSentinel != null)
-            {
-                preReadyFocusSentinel.Name = "__PreReadyFocusSentinel";
-                preReadyFocusSentinel.Visible = false;
-                preReadyFocusSentinel.MouseFilter = Control.MouseFilterEnum.Ignore;
-                contentContainer.AddChild(preReadyFocusSentinel);
-            }
-
-            firstPanel.GetParent().AddChild(modsPanel);
-
-            // Fallback if Content couldn't be resolved before tree entry
-            if (contentContainer == null)
-                contentContainer = modsPanel.Content;
-
-            _allContainers.Add(new WeakReference<VBoxContainer>(contentContainer));
-
-            // === 3. Register in _tabs ===
-            tabs.Add(modsTab, modsPanel);
-
-            // === 4. Connect tab click ===
-            modsTab.Connect(
-                NClickableControl.SignalName.Released,
-                Callable.From<NButton>(delegate
-                {
-                    try { tabManager.Call("SwitchTabTo", modsTab); }
-                    catch (Exception e) { MainFile.Log.Error($"Tab switch failed: {e}"); }
-                }));
-
-            // === 5. i18n tracking ===
-            _allTabs.Add(new WeakReference<NSettingsTab>(modsTab));
-            if (!_i18nSubscribed)
-            {
-                I18n.Changed += OnLanguageChanged;
-                _i18nSubscribed = true;
-            }
-
-            // === 6. Cap panel height so ScrollContainer can actually scroll ===
-            // NSettingsPanel.RefreshSize() expands panel to fit content, defeating scrolling.
-            // Disconnect it and set a fixed max height based on other tabs' panels.
-            try
-            {
-                // Match the first panel's height (it fits the settings screen)
-                float maxHeight = firstPanel.Size.Y;
-                if (maxHeight < 100)
-                    maxHeight = modsPanel.GetParent<Control>().Size.Y * 0.85f;
-                modsPanel.Size = new Vector2(modsPanel.Size.X, maxHeight);
-
-                // Override RefreshSize's auto-expansion on window resize
-                var viewport = modsPanel.GetViewport();
-                if (viewport != null)
-                    OverrideRefreshSize(viewport, modsPanel, maxHeight);
-            }
-            catch (Exception e)
-            {
-                MainFile.Log.Error($"Failed to cap panel height: {e}");
-            }
-
-            // === 7. Cache game font + Populate ===
             CacheGameFont(firstPanel);
-            PopulateInto(contentContainer);
-            RebuildFocusTargets(modsPanel, contentContainer, preReadyFocusSentinel);
 
-            MainFile.Log.Info("Mods tab injected into settings screen!");
+            InjectOneSettingsPage(tabManager, tabs, firstTab, firstPanel,
+                tabNodeName: "SCAgent",
+                panelNodeName: "SCAgentSettings",
+                tabLabel: I18n.TabScagent);
+
+            MainFile.Log.Info("ModConfig-SCAgent tab injected into settings screen.");
         }
         catch (Exception e)
         {
-            MainFile.Log.Error($"Failed to inject Mods tab: {e}");
+            MainFile.Log.Error($"Failed to inject settings tabs: {e}");
         }
+    }
+
+    /// <summary>克隆原生设置页结构，挂接一个自定义标签与面板。</summary>
+    private static void InjectOneSettingsPage(
+        NSettingsTabManager tabManager,
+        IDictionary tabs,
+        NSettingsTab firstTab,
+        NSettingsPanel firstPanel,
+        string tabNodeName,
+        string panelNodeName,
+        string tabLabel)
+    {
+        var modsTab = (NSettingsTab)firstTab.Duplicate();
+        modsTab.Name = tabNodeName;
+
+        var tabImage = modsTab.GetNodeOrNull<TextureRect>("TabImage");
+        if (tabImage?.Material is ShaderMaterial shader)
+            tabImage.Material = (ShaderMaterial)shader.Duplicate();
+
+        tabManager.AddChild(modsTab);
+        modsTab.SetLabel(tabLabel);
+        modsTab.Deselect();
+        PositionNewTab(tabs, modsTab);
+
+        var modsPanel = (NSettingsPanel)firstPanel.Duplicate();
+        modsPanel.Name = panelNodeName;
+        modsPanel.Visible = false;
+        Control? preReadyFocusSentinel = CreatePreReadyFocusSentinel(firstPanel);
+
+        var contentName = firstPanel.Content?.Name;
+        VBoxContainer? contentContainer = null;
+
+        foreach (var child in modsPanel.GetChildren().ToArray())
+        {
+            bool keepAsContent =
+                child is VBoxContainer &&
+                ((contentName != null && child.Name == contentName) ||
+                 (contentName == null && contentContainer == null));
+
+            if (keepAsContent && child is VBoxContainer vbox)
+            {
+                contentContainer = vbox;
+                foreach (var inner in vbox.GetChildren().ToArray())
+                {
+                    vbox.RemoveChild(inner);
+                    inner.Free();
+                }
+            }
+            else
+            {
+                modsPanel.RemoveChild(child);
+                child.Free();
+            }
+        }
+
+        if (contentContainer != null && preReadyFocusSentinel != null)
+        {
+            preReadyFocusSentinel.Name = "__PreReadyFocusSentinel";
+            preReadyFocusSentinel.Visible = false;
+            preReadyFocusSentinel.MouseFilter = Control.MouseFilterEnum.Ignore;
+            contentContainer.AddChild(preReadyFocusSentinel);
+        }
+
+        firstPanel.GetParent().AddChild(modsPanel);
+
+        if (contentContainer == null)
+            contentContainer = modsPanel.Content;
+
+        _allContainers.Add(new WeakReference<VBoxContainer>(contentContainer));
+
+        tabs.Add(modsTab, modsPanel);
+
+        modsTab.Connect(
+            NClickableControl.SignalName.Released,
+            Callable.From<NButton>(delegate
+            {
+                try { tabManager.Call("SwitchTabTo", modsTab); }
+                catch (Exception e) { MainFile.Log.Error($"Tab switch failed: {e}"); }
+            }));
+
+        _allTabs.Add(new WeakReference<NSettingsTab>(modsTab));
+        if (!_i18nSubscribed)
+        {
+            I18n.Changed += OnLanguageChanged;
+            _i18nSubscribed = true;
+        }
+
+        try
+        {
+            float maxHeight = firstPanel.Size.Y;
+            if (maxHeight < 100)
+                maxHeight = modsPanel.GetParent<Control>().Size.Y * 0.85f;
+            modsPanel.Size = new Vector2(modsPanel.Size.X, maxHeight);
+
+            var viewport = modsPanel.GetViewport();
+            if (viewport != null)
+                OverrideRefreshSize(viewport, modsPanel, maxHeight);
+        }
+        catch (Exception e)
+        {
+            MainFile.Log.Error($"Failed to cap panel height: {e}");
+        }
+
+        PopulateInto(contentContainer);
+        RebuildFocusTargets(modsPanel, contentContainer, preReadyFocusSentinel);
     }
 
     private static void PositionNewTab(IDictionary tabs, NSettingsTab modsTab)
@@ -264,14 +304,19 @@ internal static class SettingsTabInjector
                 _allTabs.RemoveAt(i);
                 continue;
             }
-            tab.SetLabel(I18n.TabMods);
+
+            if (tab.Name == "SCAgent")
+                tab.SetLabel(I18n.TabScagent);
         }
+
         RefreshUI();
     }
 
     internal static void RefreshUI()
     {
         _liveBindings.Clear();
+        _dropdownWidgets.Clear();
+        _entryRowHosts.Clear();
 
         for (int i = _allContainers.Count - 1; i >= 0; i--)
         {
@@ -512,8 +557,291 @@ internal static class SettingsTabInjector
         bindings.Add(new LiveBinding(apply));
     }
 
+    /// <summary>登记下拉控件，供 <see cref="ModConfigApi.SetDropdownOptions"/> 运行时改选项。</summary>
+    private static void TrackDropdown(string modId, string key, OptionButton dropdown)
+    {
+        var dictKey = (modId, key);
+        if (!_dropdownWidgets.TryGetValue(dictKey, out List<WeakReference<OptionButton>>? list))
+        {
+            list = new List<WeakReference<OptionButton>>();
+            _dropdownWidgets[dictKey] = list;
+        }
+
+        for (int i = list.Count - 1; i >= 0; i--)
+        {
+            if (!list[i].TryGetTarget(out OptionButton? alive) || !GodotObject.IsInstanceValid(alive))
+                list.RemoveAt(i);
+        }
+
+        list.Add(new WeakReference<OptionButton>(dropdown));
+    }
+
+    /// <summary>
+    /// 登记某一配置项对应的整行容器（多实例设置页各登记一次）。
+    /// </summary>
+    private static void RegisterEntryRowHost(string modId, string key, Control host)
+    {
+        var dictKey = (modId, key);
+        if (!_entryRowHosts.TryGetValue(dictKey, out List<WeakReference<Control>>? list))
+        {
+            list = new List<WeakReference<Control>>();
+            _entryRowHosts[dictKey] = list;
+        }
+
+        for (int i = list.Count - 1; i >= 0; i--)
+        {
+            if (!list[i].TryGetTarget(out Control? alive) || !GodotObject.IsInstanceValid(alive))
+                list.RemoveAt(i);
+        }
+
+        list.Add(new WeakReference<Control>(host));
+        host.GuiInput += inputEvent => HandleReadonlyRowGuiInput(host, modId, key, inputEvent);
+        ApplyReadonlyStateToRow(host, modId, key);
+    }
+
+    private static void RegisterReadonlyBinding(
+        string modId,
+        string key,
+        Control control,
+        Action<Control, bool> applyReadonlyState,
+        Func<string?> resolveNormalTooltip)
+    {
+        var dictKey = (modId, key);
+        if (!_readonlyBindings.TryGetValue(dictKey, out List<ReadonlyBinding>? list))
+        {
+            list = new List<ReadonlyBinding>();
+            _readonlyBindings[dictKey] = list;
+        }
+
+        for (int i = list.Count - 1; i >= 0; i--)
+        {
+            if (!list[i].ControlRef.TryGetTarget(out Control? alive) || !GodotObject.IsInstanceValid(alive))
+                list.RemoveAt(i);
+        }
+
+        list.Add(new ReadonlyBinding
+        {
+            ControlRef = new WeakReference<Control>(control),
+            ApplyReadonlyState = applyReadonlyState,
+            ResolveNormalTooltip = resolveNormalTooltip
+        });
+        ApplyReadonlyStateToControl(control, modId, key, applyReadonlyState, resolveNormalTooltip);
+    }
+
+    /// <summary>
+    /// 由 <see cref="ModConfigApi.SetEntryRowVisible"/> 调用：显示或隐藏已登记的整行（含描述与分隔线）。
+    /// </summary>
+    internal static void ApplyEntryRowVisibility(string modId, string key, bool visible)
+    {
+        if (!_entryRowHosts.TryGetValue((modId, key), out List<WeakReference<Control>>? list))
+            return;
+
+        for (int i = list.Count - 1; i >= 0; i--)
+        {
+            if (!list[i].TryGetTarget(out Control? row) || !GodotObject.IsInstanceValid(row))
+            {
+                list.RemoveAt(i);
+                continue;
+            }
+
+            row.Visible = visible;
+        }
+    }
+
+    internal static void ApplyEntryReadonly(string modId, string key, bool isReadonly, string? readonlyReason)
+    {
+        var dictKey = (modId, key);
+        if (isReadonly)
+        {
+            _entryReadonlyStates[dictKey] = new EntryReadonlyState
+            {
+                IsReadonly = true,
+                Reason = readonlyReason
+            };
+        }
+        else
+        {
+            _entryReadonlyStates.Remove(dictKey);
+        }
+
+        if (_entryRowHosts.TryGetValue(dictKey, out List<WeakReference<Control>>? rowList))
+        {
+            for (int i = rowList.Count - 1; i >= 0; i--)
+            {
+                if (!rowList[i].TryGetTarget(out Control? row) || !GodotObject.IsInstanceValid(row))
+                {
+                    rowList.RemoveAt(i);
+                    continue;
+                }
+
+                ApplyReadonlyStateToRow(row, modId, key);
+            }
+        }
+
+        if (_readonlyBindings.TryGetValue(dictKey, out List<ReadonlyBinding>? bindings))
+        {
+            for (int i = bindings.Count - 1; i >= 0; i--)
+            {
+                if (!bindings[i].ControlRef.TryGetTarget(out Control? control) || !GodotObject.IsInstanceValid(control))
+                {
+                    bindings.RemoveAt(i);
+                    continue;
+                }
+
+                ApplyReadonlyStateToControl(control, modId, key, bindings[i].ApplyReadonlyState, bindings[i].ResolveNormalTooltip);
+            }
+        }
+    }
+
+    private static void ApplyReadonlyStateToRow(Control row, string modId, string key)
+    {
+        bool isReadonly = TryGetReadonlyState(modId, key, out EntryReadonlyState? state);
+        row.Modulate = isReadonly ? ReadonlyRowModulate : Colors.White;
+        row.TooltipText = isReadonly
+            ? ResolveReadonlyReason(state)
+            : ResolveEntryTooltip(modId, key);
+        row.MouseFilter = isReadonly ? Control.MouseFilterEnum.Stop : Control.MouseFilterEnum.Pass;
+    }
+
+    private static void ApplyReadonlyStateToControl(
+        Control control,
+        string modId,
+        string key,
+        Action<Control, bool> applyReadonlyState,
+        Func<string?> resolveNormalTooltip)
+    {
+        bool isReadonly = TryGetReadonlyState(modId, key, out EntryReadonlyState? state);
+        applyReadonlyState(control, isReadonly);
+        control.TooltipText = isReadonly
+            ? ResolveReadonlyReason(state)
+            : (resolveNormalTooltip() ?? string.Empty);
+    }
+
+    private static bool TryGetReadonlyState(string modId, string key, out EntryReadonlyState? state)
+    {
+        return _entryReadonlyStates.TryGetValue((modId, key), out state) && state.IsReadonly;
+    }
+
+    private static string ResolveReadonlyReason(EntryReadonlyState? state)
+    {
+        return string.IsNullOrWhiteSpace(state?.Reason)
+            ? I18n.ReadonlySyncedFromHost
+            : state!.Reason!;
+    }
+
+    private static string ResolveEntryTooltip(string modId, string key)
+    {
+        ConfigEntry? entry = ModConfigManager.TryGetConfigEntry(modId, key);
+        if (entry == null)
+            return string.Empty;
+
+        string desc = ResolveDescription(entry);
+        return string.IsNullOrWhiteSpace(desc) ? string.Empty : desc;
+    }
+
+    private static void HandleReadonlyRowGuiInput(Control row, string modId, string key, InputEvent inputEvent)
+    {
+        if (!TryGetReadonlyState(modId, key, out EntryReadonlyState? state))
+            return;
+
+        if (inputEvent is not InputEventMouseButton { Pressed: true, ButtonIndex: MouseButton.Left })
+            return;
+
+        ShowReadonlyNotice(ResolveReadonlyReason(state));
+        row.GetViewport()?.SetInputAsHandled();
+    }
+
+    private static async void ShowReadonlyNotice(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || Engine.GetMainLoop() is not SceneTree tree)
+            return;
+
+        if (_readonlyNoticeLayer != null && GodotObject.IsInstanceValid(_readonlyNoticeLayer))
+            _readonlyNoticeLayer.QueueFree();
+
+        CanvasLayer layer = new CanvasLayer();
+        PanelContainer panel = new PanelContainer
+        {
+            AnchorLeft = 0.5f,
+            AnchorTop = 0f,
+            AnchorRight = 0.5f,
+            AnchorBottom = 0f,
+            OffsetLeft = -240f,
+            OffsetTop = 80f,
+            OffsetRight = 240f,
+            OffsetBottom = 136f
+        };
+        panel.AddThemeStyleboxOverride("panel", new StyleBoxFlat
+        {
+            BgColor = new Color(0.13f, 0.17f, 0.2f, 0.96f),
+            BorderColor = CreamGold,
+            BorderWidthLeft = 2,
+            BorderWidthTop = 2,
+            BorderWidthRight = 2,
+            BorderWidthBottom = 2,
+            CornerRadiusTopLeft = 8,
+            CornerRadiusTopRight = 8,
+            CornerRadiusBottomLeft = 8,
+            CornerRadiusBottomRight = 8,
+            ContentMarginLeft = 14,
+            ContentMarginTop = 10,
+            ContentMarginRight = 14,
+            ContentMarginBottom = 10
+        });
+
+        Label label = new Label
+        {
+            Text = text,
+            AutowrapMode = TextServer.AutowrapMode.WordSmart,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        label.AddThemeColorOverride("font_color", Colors.White);
+        label.AddThemeFontSizeOverride("font_size", 18);
+        ApplyGameFont(label);
+        panel.AddChild(label);
+        layer.AddChild(panel);
+        tree.Root.AddChild(layer);
+        _readonlyNoticeLayer = layer;
+
+        SceneTreeTimer timer = tree.CreateTimer(1.8);
+        await tree.ToSignal(timer, SceneTreeTimer.SignalName.Timeout);
+        if (GodotObject.IsInstanceValid(layer))
+            layer.QueueFree();
+        if (ReferenceEquals(_readonlyNoticeLayer, layer))
+            _readonlyNoticeLayer = null;
+    }
+
+    /// <summary>按 <see cref="ModConfigManager.TryGetConfigEntry"/> 里最新的 <c>Options</c> 重建下拉条目（不发 ItemSelected）。</summary>
+    internal static void ApplyDropdownOptions(string modId, string key)
+    {
+        ConfigEntry? entry = ModConfigManager.TryGetConfigEntry(modId, key);
+        if (entry?.Options == null)
+            return;
+
+        if (!_dropdownWidgets.TryGetValue((modId, key), out List<WeakReference<OptionButton>>? list))
+            return;
+
+        for (int i = list.Count - 1; i >= 0; i--)
+        {
+            if (!list[i].TryGetTarget(out OptionButton? dd) || !GodotObject.IsInstanceValid(dd))
+            {
+                list.RemoveAt(i);
+                continue;
+            }
+
+            dd.SetBlockSignals(true);
+            dd.Clear();
+            for (int j = 0; j < entry.Options.Length; j++)
+                dd.AddItem(ResolveDropdownOption(entry, j), j);
+
+            dd.SetBlockSignals(false);
+        }
+    }
+
     // ─── Content Population ──────────────────────────────────────
 
+    /// <summary>渲染本 fork 的 <see cref="ModConfigManager.Registrations"/>（凡调用本程序集 Register 的模组均在此页，按 modId 分节）。</summary>
     private static void PopulateInto(VBoxContainer contentContainer)
     {
         if (contentContainer == null) return;
@@ -559,7 +887,6 @@ internal static class SettingsTabInjector
             // Wire up collapse toggle with direct reference (no node lookup)
             var capturedEntriesBox = entriesBox;
             var capturedLabel = headerLabel;
-            var capturedModId = modId; // for re-resolve on language change
             var capturedReg = reg;
             headerPanel.GuiInput += (InputEvent @event) =>
             {
@@ -572,54 +899,161 @@ internal static class SettingsTabInjector
 
                     bool collapsed = ModConfigManager.CollapsedMods.Contains(modId);
                     capturedEntriesBox.Visible = !collapsed;
-                    capturedLabel.Text = $"{(collapsed ? "\u25b6" : "\u25bc")}  {capturedReg.GetLocalizedName()}";
+                    ApplyCollapsibleHeaderText(capturedLabel, capturedReg.GetLocalizedName(), collapsed);
                     ModConfigManager.SaveUiState();
                 }
             };
 
+            VBoxContainer currentTopLevelSectionBody = entriesBox;
+            VBoxContainer currentEntryParent = entriesBox;
             for (int i = 0; i < reg.Entries.Length; i++)
             {
                 var entry = reg.Entries[i];
+
                 switch (entry.Type)
                 {
                     case ConfigType.Header:
-                        AddSectionHeader(entriesBox, ResolveLabel(entry));
+                    {
+                        bool isTopLevelSection =
+                            string.IsNullOrWhiteSpace(entry.Key)
+                            || entry.Key.StartsWith("section.", StringComparison.Ordinal);
+                        VBoxContainer sectionParent = isTopLevelSection ? entriesBox : currentTopLevelSectionBody;
+                        var sectionHost = new VBoxContainer { Name = $"Section_{modId}_{entry.Key}" };
+                        sectionHost.AddThemeConstantOverride("separation", 4);
+                        sectionParent.AddChild(sectionHost);
+                        if (!string.IsNullOrWhiteSpace(entry.Key))
+                            RegisterEntryRowHost(modId, entry.Key, sectionHost);
+
+                        bool isCollapsible = !string.IsNullOrWhiteSpace(entry.Key);
+                        bool collapsed = isCollapsible && ModConfigManager.CollapsedSections.Contains(BuildSectionStateKey(modId, entry.Key));
+                        var (sectionHeaderPanel, sectionHeaderLabel) = AddSectionHeader(sectionHost, ResolveLabel(entry), collapsed, isCollapsible);
+                        var sectionBody = new VBoxContainer { Name = $"SectionBody_{modId}_{entry.Key}" };
+                        sectionBody.AddThemeConstantOverride("separation", 2);
+                        sectionBody.Visible = !collapsed;
+                        sectionHost.AddChild(sectionBody);
+
+                        var currentSection = new SectionRenderState
+                        {
+                            ModId = modId,
+                            HeaderEntry = entry,
+                            Body = sectionBody,
+                            HeaderLabel = sectionHeaderLabel,
+                            IsCollapsible = isCollapsible
+                        };
+                        if (isTopLevelSection)
+                            currentTopLevelSectionBody = sectionBody;
+                        currentEntryParent = sectionBody;
+
+                        if (isCollapsible)
+                        {
+                            var capturedSection = currentSection;
+                            sectionHeaderPanel.GuiInput += (InputEvent @event) =>
+                            {
+                                if (@event is not InputEventMouseButton { Pressed: true, ButtonIndex: MouseButton.Left })
+                                    return;
+
+                                string sectionStateKey = BuildSectionStateKey(modId, entry.Key);
+                                bool nowCollapsed;
+                                if (ModConfigManager.CollapsedSections.Contains(sectionStateKey))
+                                {
+                                    ModConfigManager.CollapsedSections.Remove(sectionStateKey);
+                                    nowCollapsed = false;
+                                }
+                                else
+                                {
+                                    ModConfigManager.CollapsedSections.Add(sectionStateKey);
+                                    nowCollapsed = true;
+                                }
+
+                                capturedSection.Body.Visible = !nowCollapsed;
+                                ApplyCollapsibleHeaderText(capturedSection.HeaderLabel, ResolveLabel(entry), nowCollapsed);
+                                ModConfigManager.SaveUiState();
+                            };
+                        }
                         break;
+                    }
                     case ConfigType.Separator:
-                        AddSeparator(entriesBox);
+                        AddSeparator(currentEntryParent);
                         break;
                     case ConfigType.Toggle:
-                        AddToggle(entriesBox, modId, entry);
+                    {
+                        var rowHost = new VBoxContainer { Name = $"CfgRow_{modId}_{entry.Key}" };
+                        currentEntryParent.AddChild(rowHost);
+                        RegisterEntryRowHost(modId, entry.Key, rowHost);
+                        AddToggle(rowHost, modId, entry);
+                        AddRowSeparator(rowHost);
                         break;
+                    }
                     case ConfigType.Slider:
-                        AddSlider(entriesBox, modId, entry);
+                    {
+                        var rowHost = new VBoxContainer { Name = $"CfgRow_{modId}_{entry.Key}" };
+                        currentEntryParent.AddChild(rowHost);
+                        RegisterEntryRowHost(modId, entry.Key, rowHost);
+                        AddSlider(rowHost, modId, entry);
+                        AddRowSeparator(rowHost);
                         break;
+                    }
                     case ConfigType.Dropdown:
-                        AddDropdown(entriesBox, modId, entry);
+                    {
+                        var rowHost = new VBoxContainer { Name = $"CfgRow_{modId}_{entry.Key}" };
+                        currentEntryParent.AddChild(rowHost);
+                        RegisterEntryRowHost(modId, entry.Key, rowHost);
+                        AddDropdown(rowHost, modId, entry);
+                        AddRowSeparator(rowHost);
                         break;
+                    }
                     case ConfigType.KeyBind:
-                        AddKeyBind(entriesBox, modId, entry);
+                    {
+                        var rowHost = new VBoxContainer { Name = $"CfgRow_{modId}_{entry.Key}" };
+                        currentEntryParent.AddChild(rowHost);
+                        RegisterEntryRowHost(modId, entry.Key, rowHost);
+                        AddKeyBind(rowHost, modId, entry);
+                        AddRowSeparator(rowHost);
                         break;
+                    }
                     case ConfigType.TextInput:
-                        AddTextInput(entriesBox, modId, entry);
+                    {
+                        var rowHost = new VBoxContainer { Name = $"CfgRow_{modId}_{entry.Key}" };
+                        currentEntryParent.AddChild(rowHost);
+                        RegisterEntryRowHost(modId, entry.Key, rowHost);
+                        AddTextInput(rowHost, modId, entry);
+                        AddRowSeparator(rowHost);
                         break;
+                    }
                     case ConfigType.Button:
-                        AddButton(entriesBox, modId, entry);
+                    {
+                        var rowHost = new VBoxContainer { Name = $"CfgRow_{modId}_{entry.Key}" };
+                        currentEntryParent.AddChild(rowHost);
+                        RegisterEntryRowHost(modId, entry.Key, rowHost);
+                        AddButton(rowHost, modId, entry);
+                        AddRowSeparator(rowHost);
                         break;
+                    }
                     case ConfigType.ColorPicker:
-                        AddColorPicker(entriesBox, modId, entry);
+                    {
+                        var rowHost = new VBoxContainer { Name = $"CfgRow_{modId}_{entry.Key}" };
+                        currentEntryParent.AddChild(rowHost);
+                        RegisterEntryRowHost(modId, entry.Key, rowHost);
+                        AddColorPicker(rowHost, modId, entry);
+                        AddRowSeparator(rowHost);
                         break;
+                    }
                 }
-
-                // Add thin row separator after each config entry (not after Header/Separator types)
-                if (entry.Type is not (ConfigType.Header or ConfigType.Separator))
-                    AddRowSeparator(entriesBox);
             }
 
             // Apply collapsed state
             if (isCollapsed)
                 entriesBox.Visible = false;
+
+            ModConfigApi.NotifyModSectionPopulated(modId);
         }
+    }
+
+    private static string BuildSectionStateKey(string modId, string key) => $"{modId}:{key}";
+
+    private static void ApplyCollapsibleHeaderText(Label label, string text, bool isCollapsed)
+    {
+        label.Text = $"{(isCollapsed ? "\u25b6" : "\u25bc")}  {text}";
     }
 
     // ─── Label Resolution ────────────────────────────────────────
@@ -802,18 +1236,44 @@ internal static class SettingsTabInjector
         return (bgPanel, label);
     }
 
-    private static void AddSectionHeader(VBoxContainer parent, string text)
+    private static (PanelContainer, Label) AddSectionHeader(VBoxContainer parent, string text, bool isCollapsed, bool isCollapsible)
     {
+        var bgPanel = new PanelContainer
+        {
+            MouseFilter = isCollapsible ? Control.MouseFilterEnum.Stop : Control.MouseFilterEnum.Ignore,
+            MouseDefaultCursorShape = isCollapsible ? Control.CursorShape.PointingHand : Control.CursorShape.Arrow,
+        };
+        var bgStyle = new StyleBoxFlat
+        {
+            BgColor = SectionHeaderBg,
+            CornerRadiusTopLeft = 3,
+            CornerRadiusTopRight = 3,
+            CornerRadiusBottomLeft = 3,
+            CornerRadiusBottomRight = 3,
+            ContentMarginLeft = 10,
+            ContentMarginRight = 10,
+            ContentMarginTop = 4,
+            ContentMarginBottom = 4,
+        };
+        bgPanel.AddThemeStyleboxOverride("panel", bgStyle);
+
         var label = new Label
         {
-            Text = text,
+            Text = isCollapsible ? string.Empty : text,
             HorizontalAlignment = HorizontalAlignment.Left,
-            CustomMinimumSize = new Vector2(0, 32),
+            CustomMinimumSize = new Vector2(0, 34),
+            VerticalAlignment = VerticalAlignment.Center,
+            MouseFilter = Control.MouseFilterEnum.Ignore,
         };
-        label.AddThemeColorOverride("font_color", DimText);
-        label.AddThemeFontSizeOverride("font_size", 20);
+        label.AddThemeColorOverride("font_color", CreamGold);
+        label.AddThemeFontSizeOverride("font_size", 18);
         ApplyGameFont(label);
-        parent.AddChild(label);
+        if (isCollapsible)
+            ApplyCollapsibleHeaderText(label, text, isCollapsed);
+
+        bgPanel.AddChild(label);
+        parent.AddChild(bgPanel);
+        return (bgPanel, label);
     }
 
     private static void AddCenteredLabel(VBoxContainer parent, string text)
@@ -881,6 +1341,16 @@ internal static class SettingsTabInjector
                 return;
             ModConfigManager.SetValue(modId, entry.Key, pressed);
         };
+        RegisterReadonlyBinding(
+            modId,
+            entry.Key,
+            toggle,
+            static (control, isReadonly) =>
+            {
+                if (control is BaseButton button)
+                    button.Disabled = isReadonly;
+            },
+            static () => string.Empty);
 
         ApplyTooltip(hbox, entry);
         hbox.AddChild(label);
@@ -956,6 +1426,16 @@ internal static class SettingsTabInjector
                 return;
             ModConfigManager.SetValue(modId, entry.Key, (float)value);
         };
+        RegisterReadonlyBinding(
+            modId,
+            entry.Key,
+            slider,
+            static (control, isReadonly) =>
+            {
+                control.MouseFilter = isReadonly ? Control.MouseFilterEnum.Ignore : Control.MouseFilterEnum.Stop;
+                control.FocusMode = isReadonly ? Control.FocusModeEnum.None : Control.FocusModeEnum.All;
+            },
+            static () => string.Empty);
 
         ApplyTooltip(hbox, entry);
         hbox.AddChild(label);
@@ -994,6 +1474,8 @@ internal static class SettingsTabInjector
             }
         }
 
+        TrackDropdown(modId, entry.Key, dropdown);
+
         var guard = new UiUpdateGuard();
         var dropdownRef = new WeakReference<OptionButton>(dropdown);
 
@@ -1021,6 +1503,16 @@ internal static class SettingsTabInjector
             if (entry.Options != null && index < entry.Options.Length)
                 ModConfigManager.SetValue(modId, entry.Key, entry.Options[index]);
         };
+        RegisterReadonlyBinding(
+            modId,
+            entry.Key,
+            dropdown,
+            static (control, isReadonly) =>
+            {
+                if (control is OptionButton optionButton)
+                    optionButton.Disabled = isReadonly;
+            },
+            static () => string.Empty);
 
         ApplyTooltip(hbox, entry);
         hbox.AddChild(label);
@@ -1093,6 +1585,16 @@ internal static class SettingsTabInjector
 
             StartKeyCapture(modId, entry, btn);
         };
+        RegisterReadonlyBinding(
+            modId,
+            entry.Key,
+            btn,
+            static (control, isReadonly) =>
+            {
+                if (control is Button button)
+                    button.Disabled = isReadonly;
+            },
+            static () => I18n.KeyBindTooltip);
 
         ApplyTooltip(hbox, entry);
         hbox.AddChild(label);
@@ -1225,6 +1727,19 @@ internal static class SettingsTabInjector
             ModConfigManager.SetValue(modId, entry.Key, lineEdit.Text);
         };
         lineEdit.TextChanged += text => ApplyValidation(lineEdit, text);
+        RegisterReadonlyBinding(
+            modId,
+            entry.Key,
+            lineEdit,
+            static (control, isReadonly) =>
+            {
+                if (control is LineEdit editable)
+                {
+                    editable.Editable = !isReadonly;
+                    editable.FocusMode = isReadonly ? Control.FocusModeEnum.None : Control.FocusModeEnum.All;
+                }
+            },
+            static () => string.Empty);
 
         // Apply initial validation state
         ApplyValidation(lineEdit, lineEdit.Text);
@@ -1265,6 +1780,16 @@ internal static class SettingsTabInjector
             try { entry.OnChanged?.Invoke(true); }
             catch (Exception e) { MainFile.Log.Error($"Button callback error [{modId}.{entry.Key}]: {e}"); }
         };
+        RegisterReadonlyBinding(
+            modId,
+            entry.Key,
+            btn,
+            static (control, isReadonly) =>
+            {
+                if (control is Button button)
+                    button.Disabled = isReadonly;
+            },
+            static () => string.Empty);
 
         ApplyTooltip(hbox, entry);
         hbox.AddChild(label);
@@ -1339,6 +1864,16 @@ internal static class SettingsTabInjector
             if (guard.Suppress) return;
             ModConfigManager.SetValue(modId, entry.Key, "#" + color.ToHtml(false).ToUpperInvariant());
         };
+        RegisterReadonlyBinding(
+            modId,
+            entry.Key,
+            picker,
+            static (control, isReadonly) =>
+            {
+                if (control is ColorPickerButton pickerButton)
+                    pickerButton.Disabled = isReadonly;
+            },
+            static () => I18n.ColorPickerTooltip);
 
         ApplyTooltip(hbox, entry);
         hbox.AddChild(label);

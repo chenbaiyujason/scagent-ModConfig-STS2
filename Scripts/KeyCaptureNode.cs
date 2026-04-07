@@ -1,6 +1,6 @@
 using Godot;
 
-namespace ModConfig;
+namespace ModConfigSCAgent;
 
 /// <summary>
 /// Temporary node added to the scene tree to capture a single key press.

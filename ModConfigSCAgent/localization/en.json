@@ -1,6 +1,7 @@
 {
   "tab_mods": "Mods",
-  "no_configs": "No mods have registered configurations.",
+  "tab_scagent": "SCAgent",
+  "no_configs": "No mods have registered configurations via ModConfig-SCAgent.",
   "reset_defaults": "Reset",
   "press_any_key": "Press any key...",
   "key_unbound": "Unbound",
