@@ -4,5 +4,5 @@
   "name": "ModConfig-SCAgent",
   "author": "SCAgent fork (based on 皮一下就很凡 ModConfig)",
   "description": "基于 ModConfig 的 SCAgent 专用分支：独立模组 ID 与用户目录，可与官方 ModConfig 同时安装。Fork for SCAgent: unique mod id and user paths; can coexist with vanilla ModConfig.\n在游戏设置页嵌入「Mods」标签页；API 与官方兼容，程序集命名空间为 ModConfigSCAgent。",
-  "version": "0.8.6"
+  "version": "0.8.12"
 }
